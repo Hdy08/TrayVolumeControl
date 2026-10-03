@@ -1,12 +1,15 @@
 #include <iostream>
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <shellapi.h>
+#include <hidusage.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include "../TrayVolumeControlLib/TVCShared.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 
 const LPCWSTR szWindowClass = L"TRAYVOLCTRL";
 const LPCWSTR szLibraryName = L"TrayVolumeControlLib.dll";
@@ -15,33 +18,32 @@ const UINT WM_TASKBARCREATED = RegisterWindowMessage(L"TaskbarCreated");
 const UINT_PTR TIMER_HEALTH = 1;
 const UINT HEALTH_INTERVAL_MS = 5000;
 const DWORD ALIVE_TIMEOUT_MS = 30000;
-const int KEEPALIVE_EVERY_N_TICKS = 12;      // re-assert the DLL registration once a minute
+const int KEEPALIVE_EVERY_N_TICKS = 12;
 
 // Volume step applied per one mouse wheel notch (0.02 = 2%)
 const float fVolumeStep = 0.02f;
 
 static UINT g_uMsgInit = 0;
 static UINT g_uMsgAlive = 0;
-static UINT g_uMsgWheel = 0;
-static UINT g_uMsgMute = 0;
 static UINT g_uMsgShutdown = 0;
 static UINT g_uMsgRefresh = 0;
 
 static HHOOK g_hCallWndHook = NULL;
-static HHOOK g_hGetMsgHook = NULL;
 static HINSTANCE g_hLibrary = NULL;
 static HWND g_hIconWnd = NULL;
 static DWORD g_dwIconThread = 0;
 static HWND g_hHostWnd = NULL;
 static DWORD g_dwLastAlive = 0;
 static int g_nHealthTicks = 0;
+static RECT g_rcIconCached = { 0 };
+static DWORD g_dwIconCachedTick = 0;
 
 // The volume is changed on a worker thread: the audio service can take seconds to answer
 // while the default device is switching, and the window procedure must stay responsive.
 static HANDLE g_hVolumeEvent = NULL;
 static HANDLE g_hVolumeThread = NULL;
 static volatile LONG g_nPendingSteps = 0;
-static volatile LONG g_bPendingMute = 0;
+static volatile LONG g_nPendingMuteToggles = 0;
 static volatile LONG g_bWorkerStop = 0;
 
 struct TRAYDATA
@@ -79,9 +81,7 @@ HINSTANCE LoadHookLibrary()
 	return LoadLibraryW(szLibraryName);
 }
 
-// Finds the volume icon in the tray toolbar and reports the window owning it: that window is
-// the one the tray sends its callback messages to and the one that has to receive the raw
-// input used to read the wheel.
+// Finds the volume icon's owner window for the tooltip hook.
 bool FindVolumeTrayIcon(HWND* phIconWnd, DWORD* pdwThreadId)
 {
 	HWND hWndTray = FindTrayToolbarWindow();
@@ -141,6 +141,94 @@ bool FindVolumeTrayIcon(HWND* phIconWnd, DWORD* pdwThreadId)
 	CloseHandle(hProcess);
 
 	return bFound;
+}
+
+bool StartListening()
+{
+	RAWINPUTDEVICE rid = {
+		HID_USAGE_PAGE_GENERIC,
+		HID_USAGE_GENERIC_MOUSE,
+		RIDEV_INPUTSINK,
+		g_hHostWnd
+	};
+	return RegisterRawInputDevices(&rid, 1, sizeof(rid)) != FALSE;
+}
+
+void StopListening()
+{
+	RAWINPUTDEVICE rid = {
+		HID_USAGE_PAGE_GENERIC,
+		HID_USAGE_GENERIC_MOUSE,
+		RIDEV_REMOVE,
+		NULL
+	};
+	RegisterRawInputDevices(&rid, 1, sizeof(rid));
+}
+
+bool GetTrayIconRect(RECT* pRect)
+{
+	NOTIFYICONIDENTIFIER niid = {};
+	niid.cbSize = sizeof(niid);
+	niid.guidItem = GUID_TRAYICONVOLUME;
+
+	if (SUCCEEDED(Shell_NotifyIconGetRect(&niid, pRect)))
+	{
+		g_rcIconCached = *pRect;
+		g_dwIconCachedTick = GetTickCount();
+		return true;
+	}
+
+	if (g_dwIconCachedTick && (GetTickCount() - g_dwIconCachedTick) < 10000)
+	{
+		*pRect = g_rcIconCached;
+		return true;
+	}
+
+	return false;
+}
+
+bool IsCursorOnTrayIcon()
+{
+	POINT ptCursor;
+	RECT rcIcon;
+	if (!GetCursorPos(&ptCursor) || !GetTrayIconRect(&rcIcon) || !PtInRect(&rcIcon, ptCursor))
+		return false;
+
+	HWND hWndUnderCursor = WindowFromPoint(ptCursor);
+	HWND hWndRoot = GetAncestor(hWndUnderCursor, GA_ROOT);
+	wchar_t szClass[64];
+	if (!GetClassNameW(hWndRoot, szClass, ARRAYSIZE(szClass))) return false;
+
+	return lstrcmpW(szClass, L"Shell_TrayWnd") == 0
+		|| lstrcmpW(szClass, L"Shell_SecondaryTrayWnd") == 0
+		|| lstrcmpW(szClass, L"NotifyIconOverflowWindow") == 0;
+}
+
+void OnRawInput(LPARAM lParam)
+{
+	RAWINPUT raw = {};
+	UINT cbSize = sizeof(raw);
+	UINT cbRead = GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &cbSize, sizeof(RAWINPUTHEADER));
+	if (cbRead == (UINT)-1 || cbRead < sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)
+		|| raw.header.dwType != RIM_TYPEMOUSE)
+		return;
+
+	USHORT flags = raw.data.mouse.usButtonFlags;
+	if (!(flags & (RI_MOUSE_WHEEL | RI_MOUSE_MIDDLE_BUTTON_UP)) || !IsCursorOnTrayIcon())
+		return;
+
+	if (flags & RI_MOUSE_WHEEL)
+	{
+		short delta = (short)raw.data.mouse.usButtonData;
+		int nSteps = delta / WHEEL_DELTA;
+		if (nSteps == 0 && delta != 0) nSteps = delta > 0 ? 1 : -1;
+		InterlockedExchangeAdd(&g_nPendingSteps, nSteps);
+	}
+	if (flags & RI_MOUSE_MIDDLE_BUTTON_UP)
+	{
+		InterlockedIncrement(&g_nPendingMuteToggles);
+	}
+	SetEvent(g_hVolumeEvent);
 }
 
 // ---------------------------------------------------------------------------- audio
@@ -246,9 +334,9 @@ DWORD WINAPI VolumeWorker(LPVOID)
 
 		// Rapid scrolling arrives as several requests; applying the sum keeps every notch.
 		LONG nSteps = InterlockedExchange(&g_nPendingSteps, 0);
-		LONG bMute = InterlockedExchange(&g_bPendingMute, 0);
+		LONG nMuteToggles = InterlockedExchange(&g_nPendingMuteToggles, 0);
 
-		if (bMute) ToggleMute();
+		if (nMuteToggles & 1) ToggleMute();
 		if (nSteps) ChangeVolume((int)nSteps);
 	}
 
@@ -273,15 +361,8 @@ void Unhook()
 {
 	if (g_hIconWnd && g_uMsgShutdown)
 	{
-		// Lets the DLL drop its raw input registration before it is unloaded.
 		DWORD_PTR dwResult = 0;
 		SendMessageTimeoutW(g_hIconWnd, g_uMsgShutdown, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &dwResult);
-	}
-
-	if (g_hGetMsgHook)
-	{
-		UnhookWindowsHookEx(g_hGetMsgHook);
-		g_hGetMsgHook = NULL;
 	}
 
 	if (g_hCallWndHook)
@@ -300,7 +381,7 @@ bool InjectHook()
 	DWORD dwIconThread = 0;
 	if (!FindVolumeTrayIcon(&hIconWnd, &dwIconThread)) return false;
 
-	if (g_hCallWndHook && g_hGetMsgHook && g_hIconWnd == hIconWnd && g_dwIconThread == dwIconThread)
+	if (g_hCallWndHook && g_hIconWnd == hIconWnd && g_dwIconThread == dwIconThread)
 	{
 		PingHook();
 		return true;
@@ -315,23 +396,12 @@ bool InjectHook()
 	}
 
 	HOOKPROC hCallWndProc = (HOOKPROC)GetProcAddress(g_hLibrary, "CallWndProc");
-	HOOKPROC hGetMsgProc = (HOOKPROC)GetProcAddress(g_hLibrary, "GetMsgProc");
-	if (!hCallWndProc || !hGetMsgProc) return false;
+	if (!hCallWndProc) return false;
 
-	// WH_GETMESSAGE is what makes the wheel reliable: raw input is *posted*, so the
-	// WH_CALLWNDPROC hook that reads the tray's callbacks never sees it.
 	HHOOK hCallWndHook = SetWindowsHookEx(WH_CALLWNDPROC, hCallWndProc, g_hLibrary, dwIconThread);
 	if (!hCallWndHook) return false;
 
-	HHOOK hGetMsgHook = SetWindowsHookEx(WH_GETMESSAGE, hGetMsgProc, g_hLibrary, dwIconThread);
-	if (!hGetMsgHook)
-	{
-		UnhookWindowsHookEx(hCallWndHook);
-		return false;
-	}
-
 	g_hCallWndHook = hCallWndHook;
-	g_hGetMsgHook = hGetMsgHook;
 	g_hIconWnd = hIconWnd;
 	g_dwIconThread = dwIconThread;
 	g_dwLastAlive = GetTickCount();
@@ -348,7 +418,7 @@ void CheckHealth()
 {
 	g_nHealthTicks++;
 
-	if (!g_hCallWndHook || !g_hGetMsgHook || !g_hIconWnd || !IsWindow(g_hIconWnd)
+	if (!g_hCallWndHook || !g_hIconWnd || !IsWindow(g_hIconWnd)
 		|| (GetTickCount() - g_dwLastAlive) > ALIVE_TIMEOUT_MS)
 	{
 		InjectHook();
@@ -363,6 +433,12 @@ void CheckHealth()
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
+	if (message == WM_INPUT)
+	{
+		OnRawInput(lParam);
+		return DefWindowProc(hWnd, message, wParam, lParam);
+	}
+
 	LRESULT lResult = DefWindowProc(hWnd, message, wParam, lParam);
 
 	if (message == WM_TASKBARCREATED)
@@ -374,16 +450,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		g_dwLastAlive = GetTickCount();
 	}
-	else if (message == g_uMsgWheel)
-	{
-		InterlockedExchangeAdd(&g_nPendingSteps, (LONG)(INT_PTR)wParam);
-		SetEvent(g_hVolumeEvent);
-	}
-	else if (message == g_uMsgMute)
-	{
-		InterlockedExchange(&g_bPendingMute, 1);
-		SetEvent(g_hVolumeEvent);
-	}
 	else if (message == WM_TIMER && wParam == TIMER_HEALTH)
 	{
 		CheckHealth();
@@ -392,9 +458,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 		CheckHealth();
 	}
-	else if (message == WM_ENDSESSION || message == WM_DESTROY)
+	else if ((message == WM_ENDSESSION && wParam) || message == WM_DESTROY)
 	{
+		StopListening();
 		Unhook();
+		if (message == WM_DESTROY) PostQuitMessage(0);
 	}
 
 	return lResult;
@@ -412,6 +480,18 @@ void StopVolumeWorker()
 	g_hVolumeThread = NULL;
 }
 
+void EnableDpiAwareness()
+{
+	typedef BOOL(WINAPI* SetProcessDpiAwarenessContextProc)(DPI_AWARENESS_CONTEXT);
+	SetProcessDpiAwarenessContextProc pSetProcessDpiAwarenessContext =
+		(SetProcessDpiAwarenessContextProc)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext");
+	if (!pSetProcessDpiAwarenessContext
+		|| !pSetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
+	{
+		SetProcessDPIAware();
+	}
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
 	_In_ LPWSTR    lpCmdLine,
@@ -422,6 +502,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	{
 		return ERROR_ALREADY_EXISTS;
 	}
+
+	EnableDpiAwareness();
 
 	g_hVolumeEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 	g_hVolumeThread = CreateThread(NULL, 0, VolumeWorker, NULL, 0, NULL);
@@ -436,7 +518,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		return 2;
 	}
 
-	// The window exists before hooking so the DLL has somewhere to answer.
+	// The window receives raw input and the tooltip hook's replies.
 	g_hHostWnd = CreateWindowEx(0, szWindowClass, nullptr, 0, 0, 0, 0, 0, nullptr, NULL, NULL, NULL);
 	if (!g_hHostWnd)
 	{
@@ -445,10 +527,18 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 	g_uMsgInit = RegisterWindowMessageW(TVC_MSG_INIT);
 	g_uMsgAlive = RegisterWindowMessageW(TVC_MSG_ALIVE);
-	g_uMsgWheel = RegisterWindowMessageW(TVC_MSG_WHEEL);
-	g_uMsgMute = RegisterWindowMessageW(TVC_MSG_MUTE);
 	g_uMsgShutdown = RegisterWindowMessageW(TVC_MSG_SHUTDOWN);
 	g_uMsgRefresh = RegisterWindowMessageW(TVC_MSG_REFRESH);
+
+	if (!StartListening())
+	{
+		MessageBoxW(NULL, L"Unable to listen for mouse input.", L"TrayVolumeControl", MB_OK | MB_ICONERROR);
+		DestroyWindow(g_hHostWnd);
+		StopVolumeWorker();
+		ReleaseMutex(hMutex);
+		CloseHandle(hMutex);
+		return 4;
+	}
 
 	InjectHook();
 	SetTimer(g_hHostWnd, TIMER_HEALTH, HEALTH_INTERVAL_MS, NULL);
@@ -460,6 +550,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		DispatchMessage(&msg);
 	}
 
+	StopListening();
 	Unhook();
 	StopVolumeWorker();
 

@@ -1,25 +1,18 @@
 #pragma once
 #include <Windows.h>
 
-#define WM_TRAYICONVOLUME 0x460
-
 // Session unique messages (RegisterWindowMessage). Fixed numbers in the private range are
 // avoided on purpose: they would be sent to a window owned by the shell, where the same
 // number may already mean something else.
 //
 // TVC_MSG_INIT:     host -> tray icon window. wParam = icon owner window, lParam = host
-//                   window. Also used as a keep-alive, so the DLL re-asserts its raw
-//                   input registration every time it arrives.
+//                   window. Also used as a keep-alive for the tooltip hook.
 // TVC_MSG_ALIVE:    DLL -> host, sent after TVC_MSG_INIT was handled.
-// TVC_MSG_WHEEL:    DLL -> host, wParam = signed number of wheel notches.
-// TVC_MSG_MUTE:     DLL -> host, middle click on the icon.
 // TVC_MSG_SHUTDOWN: host -> tray icon window, sent before the hook is removed.
 // TVC_MSG_REFRESH:  host -> tray icon window, asks the DLL to re-show the tray tooltip so
 //                   the text above the volume icon follows the level while scrolling.
 #define TVC_MSG_INIT     L"TrayVolumeControl.Init"
 #define TVC_MSG_ALIVE    L"TrayVolumeControl.Alive"
-#define TVC_MSG_WHEEL    L"TrayVolumeControl.Wheel"
-#define TVC_MSG_MUTE     L"TrayVolumeControl.Mute"
 #define TVC_MSG_SHUTDOWN L"TrayVolumeControl.Shutdown"
 #define TVC_MSG_REFRESH  L"TrayVolumeControl.Refresh"
 
